@@ -1,0 +1,799 @@
+---
+title: "Simulacrum Logistic Regression"
+author: "Matt Grant"
+date: "2023-03-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+options(scipen=999)
+
+```
+
+```{r}
+simulacrum <- readRDS(file = "simulacrum_av_data_clean.rds")
+
+simulacrum <- simulacrum %>%
+  select(!c(CancerSiteLevel3Code.y, CancerSiteLevel3CodeDesc.y, CancerSiteLevel3Desc.y, CancerSiteLevel3PublishDesc.y, SEX.y, AGE_GROUP,CancerSiteLevel3Code.x, CancerSiteLevel3Desc.x, CancerSiteLevel3PublishDesc.x, CancerSiteLevel3CodeDesc.x, ICD10_INITIAL, LINKNUMBER.y))
+```
+
+```{r}
+t_simulacrum <- simulacrum
+```
+
+# Cleaning
+
+## Initial cleaning
+
+The dataset I'm using is a cleaned version of the simulacrum datasets (`sim_av_patient` and `sim_av_tumour`). It needs to be cleaned up a bit more before running a logistic regression.
+
+Steps to take:
+
+-   Remove any patient with multiple tumours
+
+-   Remove all but breast, bowel, and lung cancer patients
+
+-   Remove any columns that are dates
+
+-   Remove any columns that are related to death ('causeofdeath') -- except the newvitalstatus, which is your target
+
+-   Remove patients where `newvitalstatus` is 'X'
+
+-   Change empty values to NA
+
+-   Remove `ER_STATUS` and `PR_STATUS` (keeping `ER_SCORE` and `PR_SCORE` for prediction)
+
+-   Remove GLEASON measures
+
+```{r}
+t_simulacrum <- t_simulacrum %>%
+  distinct(PATIENTID, .keep_all = TRUE) %>%
+  filter(
+    #Breast cancer
+    SITE_ICD10_O2_3CHAR == "C50" | 
+    #Bowel cancer
+    SITE_ICD10_O2_3CHAR == "C18" |
+    SITE_ICD10_O2_3CHAR == "C19" |
+    SITE_ICD10_O2_3CHAR == "C20" |
+    SITE_ICD10_O2_3CHAR == "C21" | 
+    #Lung cancer
+    SITE_ICD10_O2_3CHAR == "C33" |
+    SITE_ICD10_O2_3CHAR == "C34") %>% 
+  select(!c(VITALSTATUSDATE, VITALSTATUSDATE_YEAR, DIAGNOSISDATEBEST, DIAGNOSIS_YEAR, DATE_FIRST_SURGERY, DEATHCAUSECODE_1A, DEATHCAUSECODE_1B, DEATHCAUSECODE_1C, DEATHCAUSECODE_2, DEATHCAUSECODE_UNDERLYING, DEATHLOCATIONCODE, LINKNUMBER.x, SITE_ICD10_O2, MORPH_ICD10_O2, BEHAVIOUR_ICD10_O2, STAGE_BEST_SYSTEM,  GLEASON_PRIMARY, GLEASON_SECONDARY, GLEASON_TERTIARY, GLEASON_COMBINED, SCREENINGSTATUSFULL_CODE, CNS, CREG_CODE)) %>%
+  filter(NEWVITALSTATUS != 'X') 
+t_simulacrum <- na_if(t_simulacrum, '')
+t_simulacrum <- t_simulacrum %>%
+  select(!PATIENTID)
+
+table(t_simulacrum$SITE_ICD10_O2_3CHAR)
+```
+
+## Cleaning NA values
+
+```{r}
+t_simulacrum %>% summarise(across(everything(), ~ sum(is.na(.))))
+
+```
+
+### STAGE_BEST
+
+```{r}
+table(t_simulacrum$STAGE_BEST, useNA = 'ifany')
+```
+
+| Value | Description       |
+|-------|-------------------|
+| 0     | 0                 |
+| 1     | 1                 |
+| 2     | 2                 |
+| 3     | 3                 |
+| 4     | 4                 |
+| 5     | Outdate/invalid   |
+| 6     | Not stageable     |
+| ?     | Insufficient Info |
+| U     | Unstageable       |
+
+Group 1A, 1A1, etc. into their initial integer to align with dictionary
+
+Changing `NA` and `6` to `?`
+
+Setting `0` as the factor level reference.
+
+```{r}
+t_simulacrum <- t_simulacrum %>%
+  mutate(STAGE_BEST = substring(t_simulacrum$STAGE_BEST, 1, 1))
+
+t_simulacrum$STAGE_BEST <- replace_na(t_simulacrum$STAGE_BEST, '?')
+t_simulacrum$STAGE_BEST <- t_simulacrum$STAGE_BEST %>%
+  replace(t_simulacrum$STAGE_BEST == '6', '?') %>%
+  replace(t_simulacrum$STAGE_BEST == 'X', '?')
+t_simulacrum$STAGE_BEST <- factor(t_simulacrum$STAGE_BEST, levels = c('0','1', '2', '3', '4', 'U', '?'))
+
+table(t_simulacrum$STAGE_BEST, useNA = 'always')
+
+
+STAGE_BEST_TABLE <- round(prop.table(table(t_simulacrum$NEWVITALSTATUS,
+                                           t_simulacrum$STAGE_BEST), 
+                                     margin = 2), 
+                          2)
+STAGE_BEST_TABLE
+round(prop.table(table(t_simulacrum$STAGE_BEST)), 2)
+```
+
+### T_BEST
+
+```{r}
+table(t_simulacrum$T_BEST, useNA = "ifany")
+```
+
+Recode NA to 0 which is "Main tumour cannot be found". The reference grade for this feature will be `1.`
+
+```{r}
+t_simulacrum$T_BEST <- replace_na(t_simulacrum$T_BEST, '0')
+t_simulacrum$T_BEST <- factor(t_simulacrum$T_BEST, levels = c('1', '2', '3', '4', '0'))
+
+table(t_simulacrum$T_BEST, useNA = 'always')
+```
+
+### M_BEST
+
+```{r}
+table(t_simulacrum$M_BEST, useNA = 'always')
+```
+
+Measure explanation:
+
+Distant metastasis (M)
+
+-   MX: Metastasis cannot be measured.
+
+-   M0: Cancer has not spread to other parts of the body.
+
+-   M1: Cancer has spread to other parts of the body.
+
+So recode NA in to X.
+
+Reference factor for this feature is 0, cancer has not spread to other parts of the body
+
+```{r}
+t_simulacrum$M_BEST <- replace_na(t_simulacrum$M_BEST, 'X')
+t_simulacrum$M_BEST <- factor(t_simulacrum$M_BEST, levels = c('0', '1', 'X'))
+table(t_simulacrum$M_BEST, useNA = 'always')
+```
+
+### N_BEST
+
+```{r}
+table(t_simulacrum$N_BEST, useNA = "always")
+```
+
+Regional lymph nodes (N)
+
+-   NX: Cancer in nearby lymph nodes cannot be measured.
+
+-   N0: There is no cancer in nearby lymph nodes.
+
+-   N1, N2, N3: Refers to the number and location of lymph nodes that contain cancer. The higher the number after the N, the more lymph nodes that contain cancer.
+
+Reference factor for `N_BEST` will be 0 - there is no cancer in nearby lymph nodes.
+
+```{r}
+#Recode NA to X
+t_simulacrum$N_BEST <- replace_na(t_simulacrum$N_BEST, 'X')
+t_simulacrum$N_BEST <- factor(t_simulacrum$N_BEST, levels = c('0', '1', '2', '3',  'X'))
+table(t_simulacrum$N_BEST, useNA = 'always')
+```
+
+### PERFORMANCESTATUS
+
+```{r}
+table(t_simulacrum$PERFORMANCESTATUS, useNA = "always")
+```
+
+| **GRADE** |                                                                **ECOG PERFORMANCE STATUS**                                                                |
+|:---------:|:---------------------------------------------------------------------------------------------------------------------------------------------------------:|
+|     0     |                                      Fully active, able to carry on all pre-disease performance without restriction                                       |
+|     1     | Restricted in physically strenuous activity but ambulatory and able to carry out work of a light or sedentary nature, e.g., light house work, office work |
+|     2     |              Ambulatory and capable of all selfcare but unable to carry out any work activities; up and about more than 50% of waking hours               |
+|     3     |                                 Capable of only limited selfcare; confined to bed or chair more than 50% of waking hours                                  |
+|     4     |                                    Completely disabled; cannot carry on any selfcare; totally confined to bed or chair                                    |
+
+We also know that 9 is used as a dump code.
+
+Reference factor for this feature is `0` - fully active
+
+```{r}
+#recode m values to whole integers
+t_simulacrum$PERFORMANCESTATUS <- t_simulacrum$PERFORMANCESTATUS %>%
+  replace(t_simulacrum$PERFORMANCESTATUS == '1m', 1) %>%
+  replace(t_simulacrum$PERFORMANCESTATUS == '2m', 2) %>%
+  replace(t_simulacrum$PERFORMANCESTATUS == '3m', 3) %>%
+  replace(t_simulacrum$PERFORMANCESTATUS == '4m', 4) 
+  #recode NA to 5
+t_simulacrum$PERFORMANCESTATUS <- replace_na(t_simulacrum$PERFORMANCESTATUS, '5')
+t_simulacrum$PERFORMANCESTATUS <- factor(t_simulacrum$PERFORMANCESTATUS, levels = c('0', '1', '2', '3', '4', '5', '9'))
+table(t_simulacrum$PERFORMANCESTATUS, useNA = "always")
+```
+
+### GRADE
+
+```{r}
+table(t_simulacrum$GRADE, useNA = 'always')
+```
+
+-   Grade X: Grade cannot be assessed (undetermined grade)
+
+-   Grade 1: Well differentiated (low grade)
+
+-   Grade 2: Moderately differentiated (intermediate grade)
+
+-   Grade 3: Poorly differentiated (high grade)
+
+-   Grade 4: Undifferentiated (high grade)
+
+Since x is "undetermined" we can put all the NA in there. We will use `G1` as the reference factor level for this feature.
+
+```{r}
+t_simulacrum$GRADE <- replace_na(t_simulacrum$GRADE, 'GX')
+t_simulacrum$GRADE <- factor(t_simulacrum$GRADE, levels = c('G1', 'G2', 'G3', 'G4', 'GX'))
+table(t_simulacrum$GRADE, useNA = 'always')
+```
+
+### ETHNICITY
+
+```{r}
+table(t_simulacrum$ETHNICITY, useNA = 'always')
+```
+
+|     |                               |
+|-----|-------------------------------|
+| 0   | WHITE                         |
+| 8   | 8 OTHER                       |
+| A   | WHITE BRITISH                 |
+| B   | WHITE IRISH                   |
+| C   | ANY OTHER WHITE BACKGROUND    |
+| D   | WHITE AND BLACK CARIBBEAN     |
+| E   | MIXED WHITE AND BLACK AFRICAN |
+| F   | MIXED WHITE AND ASIAN         |
+| G   | ANY OTHER MIXED BACKGROUND    |
+| H   | ASIAN INDIAN                  |
+| J   | ASIAN PAKISTANI               |
+| K   | ASIAN BANGLADESHI             |
+| L   | ANY OTHER ASIAN BACKGROUND    |
+| M   | BLACK CARIBBEAN               |
+| N   | BLACK AFRICAN                 |
+| P   | ANY OTHER BLACK BACKGROUND    |
+| R   | CHINESE                       |
+| S   | ANY OTHER ETHNIC GROUP        |
+| X   | NOT KNOWN                     |
+| Z   | NOT STATED                    |
+
+Recoding `NA` as `X` since that is akin to "not known". `WHITE BRITISH` will be the reference factor level for this feature as it is the biggest group.
+
+```{r}
+t_simulacrum$ETHNICITY <- replace_na(t_simulacrum$ETHNICITY, 'X')
+t_simulacrum$ETHNICITY <- t_simulacrum$ETHNICITY %>%
+  replace(t_simulacrum$ETHNICITY == 0, 'C') %>%
+  replace(t_simulacrum$ETHNICITY == 8, 'C') 
+t_simulacrum$ETHNICITY <- factor(t_simulacrum$ETHNICITY, levels = c('A', 'B', 'C', 'D',  'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'P', 'R', 'S', 'X', 'Z'))
+table(t_simulacrum$ETHNICITY, useNA = 'always')
+```
+
+### ER_STATUS
+
+```{r}
+table(t_simulacrum$ER_SCORE, useNA = 'ifany')
+table(t_simulacrum$ER_STATUS, useNA = 'ifany')
+table(t_simulacrum$ER_STATUS, t_simulacrum$ER_SCORE, useNA = 'always')
+```
+
+NHS data dictionary only lists 3 values for `ER_STATUS` (Estrogen Receptor Status): `P` (positive), `N` (negative), `X` (no test performed)
+
+Can comfortable put `Pm` into `P` although it has no associated score, `U` could feasibly be "untested", `B` is listed as "borderline" in `HER2_STATUS` so likely the same here.
+
+We are using `N` - negative as the reference factor level for this feature.
+
+```{r}
+t_simulacrum$ER_STATUS <- replace_na(t_simulacrum$ER_STATUS, 'X') %>%
+  replace(t_simulacrum$ER_STATUS == 'Pm', 'P') %>%
+  replace(t_simulacrum$ER_STATUS == 'U', 'X')
+t_simulacrum$ER_STATUS <- factor(t_simulacrum$ER_STATUS, levels = c('N', 'B', 'P', 'X'))
+table(t_simulacrum$ER_STATUS, useNA = 'always')
+#drop ER_SCORE 
+t_simulacrum <- t_simulacrum %>%
+  select(!c(ER_SCORE))
+```
+
+### PR_STATUS
+
+```{r}
+table(t_simulacrum$PR_SCORE, useNA = 'always')
+table(t_simulacrum$PR_STATUS, useNA = 'always')
+table(t_simulacrum$PR_STATUS, t_simulacrum$PR_SCORE, useNA = 'always')
+```
+
+Very similar makeup to `ER_STATUS` and `ER_SCORE` so going to do the same with them.
+
+We are using `N` as the reference factor level for this feature.
+
+```{r}
+t_simulacrum$PR_STATUS <- replace_na(t_simulacrum$PR_STATUS, 'X') %>%
+  replace(t_simulacrum$PR_STATUS == 'Pm', 'P') %>%
+  replace(t_simulacrum$PR_STATUS == 'U', 'X')
+t_simulacrum$PR_STATUS <- factor(t_simulacrum$PR_STATUS, levels = c('N', 'B', 'P', 'X'))
+
+table(t_simulacrum$PR_STATUS, useNA = 'always')
+#drop ER_SCORE 
+t_simulacrum <- t_simulacrum %>%
+  select(!c(PR_SCORE))
+```
+
+### HER2_STATUS
+
+```{r}
+table(t_simulacrum$HER2_STATUS, useNA = 'ifany')
+```
+
+Similar to the `ER_STATUS` and `PR_STATUS`.
+
+NHS data dictionary for this code lists `B` as "borderline".
+
+We are using `N` - negative as the reference factor level for this feature.
+
+```{r}
+t_simulacrum$HER2_STATUS <- replace_na(t_simulacrum$HER2_STATUS, 'X') %>%
+  replace(t_simulacrum$HER2_STATUS == 'Pm', 'P') %>%
+  replace(t_simulacrum$HER2_STATUS == 'U', 'X')
+t_simulacrum$HER2_STATUS <- factor(t_simulacrum$HER2_STATUS, levels = c('N', 'B', 'P', 'X'))
+
+table(t_simulacrum$HER2_STATUS, useNA = 'always')
+
+```
+
+### CANCERCAREPLANINTENT
+
+```{r}
+table(t_simulacrum$CANCERCAREPLANINTENT, useNA = 'ifany')
+```
+
+|     |                     |
+|-----|---------------------|
+| 9   | Not known           |
+| C   | Curative            |
+| X   | No active treatment |
+| Z   | Non Curative        |
+
+Dropping all `NA` into `9` "Not known".
+
+We will use `X` - no active treatment as the reference factor level for this feature.
+
+```{r}
+t_simulacrum$CANCERCAREPLANINTENT <- replace_na(t_simulacrum$CANCERCAREPLANINTENT, '9') %>%
+  replace(t_simulacrum$CANCERCAREPLANINTENT == 'Cm', 'C') %>%
+  replace(t_simulacrum$CANCERCAREPLANINTENT == 'Zm', 'Z')
+t_simulacrum$CANCERCAREPLANINTENT <- factor(t_simulacrum$CANCERCAREPLANINTENT, levels = c('X', 'C', 'Z', '9'))
+
+table(t_simulacrum$CANCERCAREPLANINTENT, useNA = 'always')
+```
+
+### ACE27
+
+```{r}
+table(t_simulacrum$ACE27, useNA = 'ifany')
+```
+
+Going to recode `Xm` categories into respective integer, and put `NA` into `9` as it is not listed in the data dictionary.
+
+| Code | Description |
+|:----:|:-----------:|
+|  0   |    None     |
+|  1   |    Mild     |
+|  2   |  Moderate   |
+|  3   |   Severe    |
+
+The reference factor level for this feature is `0` - none.
+
+```{r}
+t_simulacrum$ACE27 <- replace_na(t_simulacrum$ACE27, '9') %>%
+  replace(t_simulacrum$ACE27 == '1m', '1') %>%
+  replace(t_simulacrum$ACE27 == '2m', '2') %>%
+  replace(t_simulacrum$ACE27 == '3m', '3')
+t_simulacrum$ACE27 <- factor(t_simulacrum$ACE27, levels = c('0', '1', '2', '3', '9'))
+
+table(t_simulacrum$ACE27, useNA = 'always')
+```
+
+### LATERALITY
+
+```{r}
+table(t_simulacrum$LATERALITY, useNA = 'ifany') 
+```
+
+|     |           |
+|-----|-----------|
+| L   | Left      |
+| R   | Right     |
+| M   | Midline   |
+| B   | Bilateral |
+
+Going to recode `NA` into `X`.
+
+As `L` is the largest group, it will be used as the reference factor level for this feature.
+
+```{r}
+t_simulacrum$LATERALITY <- replace_na(t_simulacrum$LATERALITY, 'X')
+t_simulacrum$LATERALITY <- factor(t_simulacrum$LATERALITY, levels = c('L', 'M', 'R', 'B', 'X'))
+
+table(t_simulacrum$LATERALITY, useNA = 'always')
+```
+
+### NEWVITALSTATUS
+
+```{r}
+t_simulacrum$NEWVITALSTATUS <- as.factor(t_simulacrum$NEWVITALSTATUS)
+t_simulacrum$QUINTILE_2015 <- as.factor(t_simulacrum$QUINTILE_2015)
+
+```
+
+`A` - Alive is the reference value for this factor.
+
+## Cancer type
+
+Create a cancer type field that aggregates the relevant cancer types
+
+`C18, C19, C20, C21 - 'Bowel'`
+
+`C33, C34 - 'Lung'`
+
+`C50 - 'Breast'`
+
+Setting `Breast` as the reference category as it is the largest
+
+```{r}
+t_simulacrum <- t_simulacrum %>%
+  mutate(CANCER_TYPE = case_when(SITE_ICD10_O2_3CHAR == 'C18' ~ 'Bowel',
+                                 SITE_ICD10_O2_3CHAR == 'C19' ~ 'Bowel',
+                                 SITE_ICD10_O2_3CHAR == 'C20' ~ 'Bowel',
+                                 SITE_ICD10_O2_3CHAR == 'C21' ~ 'Bowel',
+                                 SITE_ICD10_O2_3CHAR == 'C33' ~ 'Lung',
+                                 SITE_ICD10_O2_3CHAR == 'C34' ~ 'Lung',
+                                 SITE_ICD10_O2_3CHAR == 'C50' ~ 'Breast'))
+
+table(t_simulacrum$CANCER_TYPE)
+t_simulacrum$CANCER_TYPE <- factor(t_simulacrum$CANCER_TYPE, levels = c('Breast', 'Bowel', 'Lung')) 
+t_simulacrum <- t_simulacrum %>%
+  select(!SITE_ICD10_O2_3CHAR)
+```
+
+# Logistical Regression
+
+The aim is to build a logistical regression model that can predict the vital status (`NEWVITALSTATUS`) of breast cancer patients.
+
+## Setting out test data
+
+```{r}
+#Build out the sample training and testing sets
+set.seed(123)
+sample <- sample(c(TRUE, FALSE), nrow(t_simulacrum), replace = T, prob = c(0.7,0.3))
+training_data <- t_simulacrum[sample, ]
+test_data <- t_simulacrum[!sample, ]
+```
+
+Check that the sampling gives similar proportions of alive/dead in the training and test data sets
+
+```{r}
+round(prop.table(table(t_simulacrum$NEWVITALSTATUS)) * 100, 1)
+round(prop.table(table(training_data$NEWVITALSTATUS)) * 100, 1)
+round(prop.table(table(test_data$NEWVITALSTATUS)) * 100, 1)
+```
+
+## Naive model
+
+First we need to build the naive model, which has no predictive variables and will act as the baseline for the actual predictive models we build.
+
+```{r}
+#create model
+naive_model <- glm(NEWVITALSTATUS ~ 1, data = training_data, family=binomial)
+summary(naive_model)
+```
+
+```{r}
+#use model to predict outcomes in training data
+naive_model_train_prob <- naive_model %>%
+  predict(type = "response")
+
+#Use model to predict outcomes of test data
+naive_model_test_prob <- naive_model %>% 
+  predict(test_data, type = "response")
+naive_model_pred_classes <- ifelse(naive_model_test_prob > 0.5, 
+                                                          "D", 
+                                                          "A")
+
+#create confusion matrix
+naive_model_confusion_matrix <- table(naive_model_pred_classes, test_data$NEWVITALSTATUS)
+print(paste0("Confusion matrix"))
+naive_model_confusion_matrix
+TN = naive_model_confusion_matrix[1, 1]
+FN = 0
+FP = naive_model_confusion_matrix[1, 2]
+TP = 0
+paste("TN:", TN, "FN:", FN, "FP:", FP, "TP:", TP)
+Accuracy = (TP + TN)/(TP + FP + TN + FN)
+Precision = TP/(TP + FP)
+Recall = TP/(TP + FN)
+F1_score = 2 * ((Precision * Recall) / (Precision + Recall))
+
+print(paste("Test Accuracy:", Accuracy))
+print(paste("Precision:", round(Precision, 3)))
+print(paste("Recall:", round(Recall, 3)))
+print(paste("F1_score:", round(F1_score, 3)))
+
+Naive_Accuracy = Accuracy
+```
+
+## Model 1 - CANCER_TYPE
+
+Using `CANCER_TYPE`.
+
+```{r}
+#create model
+model_1 <- glm(NEWVITALSTATUS ~ CANCER_TYPE, data = training_data, family=binomial)
+summary(model_1)
+```
+
+```{r}
+#use model to predict outcomes in training data
+model_1_train_prob <- model_1 %>%
+  predict(type = "response")
+
+#Use model to predict outcomes of test data
+model_1_test_prob <- model_1 %>% 
+  predict(test_data, type = "response")
+model_1_pred_classes <- ifelse(model_1_test_prob > 0.5, 
+                                                          "D", 
+                                                          "A")
+
+#create confusion matrix
+model_1_confusion_matrix <- table(model_1_pred_classes, test_data$NEWVITALSTATUS)
+print(paste0("Confusion matrix"))
+model_1_confusion_matrix
+TN = model_1_confusion_matrix[1, 1]
+FN = model_1_confusion_matrix[2, 1]
+FP = model_1_confusion_matrix[1, 2]
+TP = model_1_confusion_matrix[2, 2]
+cat("TN:", TN, "FN:", FN, "FP:", FP, "TP:", TP)
+Accuracy = (TP + TN)/(TP + FP + TN + FN)
+Precision = TP/(TP + FP)
+Recall = TP/(TP + FN)
+F1_score = 2 * ((Precision * Recall) / (Precision + Recall))
+print(paste("Accuracy:", Accuracy))
+print(paste("Precision:", round(Precision, 3)))
+print(paste("Recall:", round(Recall, 3)))
+print(paste("F1_score:", round(F1_score, 3)))
+model_1_accuracy = Accuracy
+paste("Improvement over naive:")
+model_1_accuracy - Naive_Accuracy
+
+```
+
+## Model 2 - STAGE_BEST
+
+```{r}
+#create model
+model_2 <- glm(NEWVITALSTATUS ~ CANCER_TYPE + STAGE_BEST, data = training_data, family=binomial)
+summary(model_2)
+
+#use model to predict outcomes in training data
+model_2_train_prob <- model_2 %>%
+  predict(type = "response")
+
+#Use model to predict outcomes of test data
+model_2_test_prob <- model_2 %>% 
+  predict(test_data, type = "response")
+model_2_pred_classes <- ifelse(model_2_test_prob > 0.5, 
+                                                          "D", 
+                                                          "A")
+
+#create confusion matrix
+model_2_confusion_matrix <- table(model_2_pred_classes, test_data$NEWVITALSTATUS)
+print(paste0("Confusion matrix"))
+model_2_confusion_matrix
+TN = model_2_confusion_matrix[1, 1]
+FN = model_2_confusion_matrix[2, 1]
+FP = model_2_confusion_matrix[1, 2]
+TP = model_2_confusion_matrix[2, 2]
+paste("TN:", TN, "FN:", FN, "FP:", FP, "TP:", TP)
+Accuracy = (TP + TN)/(TP + FP + TN + FN)
+Precision = TP/(TP + FP)
+Recall = TP/(TP + FN)
+F1_score = 2 * ((Precision * Recall) / (Precision + Recall))
+print(paste("Accuracy:", Accuracy))
+print(paste("Precision:", round(Precision, 3)))
+print(paste("Recall:", round(Recall, 3)))
+print(paste("F1_score:", round(F1_score, 3)))
+model_2_accuracy = Accuracy
+confint(model_2)
+exp(confint(model_2))
+```
+
+```{r}
+#ggplot(coeff, aes(x = term, y = estimate, fill = term)) + geom_col() + coord_flip()
+summary(model_2)$coeff
+exp(coefficients(model_2))
+```
+
+## Model 3 - T/M/N_BEST
+
+```{r}
+#create model
+model_3 <- glm(NEWVITALSTATUS ~ CANCER_TYPE + STAGE_BEST + T_BEST + M_BEST + N_BEST, data = training_data, family=binomial)
+summary(model_3)
+
+#use model to predict outcomes in training data
+model_3_train_prob <- model_3 %>%
+  predict(type = "response")
+
+#Use model to predict outcomes of test data
+model_3_test_prob <- model_3 %>% 
+  predict(test_data, type = "response")
+model_3_pred_classes <- ifelse(model_3_test_prob > 0.5, 
+                                                          "D", 
+                                                          "A")
+
+#create confusion matrix
+model_3_confusion_matrix <- table(model_3_pred_classes, test_data$NEWVITALSTATUS)
+print(paste0("Confusion matrix"))
+model_3_confusion_matrix
+TN = model_3_confusion_matrix[1, 1]
+FN = model_3_confusion_matrix[2, 1]
+FP = model_3_confusion_matrix[1, 2]
+TP = model_3_confusion_matrix[2, 2]
+paste("TN:", TN, "FN:", FN, "FP:", FP, "TP:", TP)
+Accuracy = (TP + TN)/(TP + FP + TN + FN)
+Precision = TP/(TP + FP)
+Recall = TP/(TP + FN)
+F1_score = 2 * ((Precision * Recall) / (Precision + Recall))
+print(paste("Accuracy:", Accuracy))
+print(paste("Precision:", round(Precision, 3)))
+print(paste("Recall:", round(Recall, 3)))
+print(paste("F1_score:", round(F1_score, 3)))
+model_3_accuracy = Accuracy
+```
+
+## Model 4 - Sex
+
+```{r}
+#create model
+model_4 <- glm(NEWVITALSTATUS ~ CANCER_TYPE + STAGE_BEST + T_BEST + M_BEST + N_BEST+ SEX.x, data = training_data, family=binomial)
+summary(model_4)
+
+#use model to predict outcomes in training data
+model_4_train_prob <- model_4 %>%
+  predict(type = "response")
+
+#Use model to predict outcomes of test data
+model_4_test_prob <- model_4 %>% 
+  predict(test_data, type = "response")
+model_4_pred_classes <- ifelse(model_4_test_prob > 0.5, 
+                                                          "D", 
+                                                          "A")
+
+#create confusion matrix
+model_4_confusion_matrix <- table(model_4_pred_classes, test_data$NEWVITALSTATUS)
+print(paste0("Confusion matrix"))
+model_4_confusion_matrix
+TN = model_4_confusion_matrix[1, 1]
+FN = model_4_confusion_matrix[2, 1]
+FP = model_4_confusion_matrix[1, 2]
+TP = model_4_confusion_matrix[2, 2]
+paste("TN:", TN, "FN:", FN, "FP:", FP, "TP:", TP)
+Accuracy = (TP + TN)/(TP + FP + TN + FN)
+Precision = TP/(TP + FP)
+Recall = TP/(TP + FN)
+F1_score = 2 * ((Precision * Recall) / (Precision + Recall))
+print(paste("Accuracy:", Accuracy))
+print(paste("Precision:", round(Precision, 3)))
+print(paste("Recall:", round(Recall, 3)))
+print(paste("F1_score:", round(F1_score, 3)))
+model_4_accuracy = Accuracy
+```
+
+## Model 5 - Age
+
+```{r}
+#create model
+model_5 <- glm(NEWVITALSTATUS ~ CANCER_TYPE + STAGE_BEST + T_BEST + M_BEST + N_BEST+ AGE, data = training_data, family=binomial)
+summary(model_5)
+
+#use model to predict outcomes in training data
+model_5_train_prob <- model_5 %>%
+  predict(type = "response")
+
+#Use model to predict outcomes of test data
+model_5_test_prob <- model_5 %>% 
+  predict(test_data, type = "response")
+model_5_pred_classes <- ifelse(model_5_test_prob > 0.5, 
+                                                          "D", 
+                                                          "A")
+
+#create confusion matrix
+model_5_confusion_matrix <- table(model_5_pred_classes, test_data$NEWVITALSTATUS)
+print(paste0("Confusion matrix"))
+model_5_confusion_matrix
+TN = model_5_confusion_matrix[1, 1]
+FN = model_5_confusion_matrix[2, 1]
+FP = model_5_confusion_matrix[1, 2]
+TP = model_5_confusion_matrix[2, 2]
+paste("TN:", TN, "FN:", FN, "FP:", FP, "TP:", TP)
+Accuracy = (TP + TN)/(TP + FP + TN + FN)
+Precision = TP/(TP + FP)
+Recall = TP/(TP + FN)
+F1_score = 2 * ((Precision * Recall) / (Precision + Recall))
+print(paste("Accuracy:", Accuracy))
+print(paste("Precision:", round(Precision, 3)))
+print(paste("Recall:", round(Recall, 3)))
+print(paste("F1_score:", round(F1_score, 3)))
+model_5_accuracy = Accuracy
+```
+
+## Model 6 - Deprivation Quintile
+
+```{r}
+#create model
+model_6 <- glm(NEWVITALSTATUS ~ CANCER_TYPE + STAGE_BEST + QUINTILE_2015, data = training_data, family=binomial)
+summary(model_6)
+exp(coefficients(model_6))
+
+#use model to predict outcomes in training data
+model_6_train_prob <- model_6 %>%
+  predict(type = "response")
+
+#Use model to predict outcomes of test data
+model_6_test_prob <- model_6 %>% 
+  predict(test_data, type = "response")
+model_6_pred_classes <- ifelse(model_6_test_prob > 0.5, 
+                                                          "D", 
+                                                          "A")
+
+#create confusion matrix
+model_6_confusion_matrix <- table(model_6_pred_classes, test_data$NEWVITALSTATUS)
+print(paste0("Confusion matrix"))
+model_6_confusion_matrix
+TN = model_6_confusion_matrix[1, 1]
+FN = model_6_confusion_matrix[2, 1]
+FP = model_6_confusion_matrix[1, 2]
+TP = model_6_confusion_matrix[2, 2]
+paste("TN:", TN, "FN:", FN, "FP:", FP, "TP:", TP)
+Accuracy = (TP + TN)/(TP + FP + TN + FN)
+Precision = TP/(TP + FP)
+Recall = TP/(TP + FN)
+F1_score = 2 * ((Precision * Recall) / (Precision + Recall))
+print(paste("Accuracy:", Accuracy))
+print(paste("Precision:", round(Precision, 3)))
+print(paste("Recall:", round(Recall, 3)))
+print(paste("F1_score:", round(F1_score, 3)))
+model_6_accuracy = Accuracy
+#confint(model_6)
+#exp(confint(model_6))
+```
+
+# Comparing model accuracies
+
+```{r}
+model_name <- c("Naive model", "model_1", "model_2", "model_3", "model_4", "model_5")
+model_acc <- round(c(Naive_Accuracy, model_1_accuracy, model_2_accuracy, model_3_accuracy, model_4_accuracy, model_5_accuracy), 3) 
+new_feature <- c(NA, "Cancer type", "Stage", "T/M/N", "Sex", "Age")
+df <- tibble(model_name, model_acc, new_feature)
+df <- df %>%
+  mutate(difference = round(model_acc - Naive_Accuracy, 2))
+df %>% arrange(desc(model_acc))
+
+
+```
